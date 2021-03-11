@@ -83,7 +83,7 @@ if [ ! -z "$2" ]; then
   workspace=$2
   echo "Using workspace provided as argument: " $workspace
 else
-  echo "Using workspace set in the script."
+  echo "Using workspace set in the script: " $workspace
 fi
 
 # Make sure $workspace does not have spaces
@@ -116,7 +116,7 @@ cat > workspace.template.json <<EOF
   {
     "attributes": {
       "name":"placeholder",
-      "terraform-version": "0.11.14"
+      "terraform-version": "0.13.6"
     },
     "type":"workspaces"
   }
@@ -234,10 +234,20 @@ else
   variables_file=variables.csv
 fi
 
+# Function to process special characters in sed
+escape_string()
+{
+  printf '%s' "$1" | sed -e 's/\([&\]\)/\\\1/g'
+}
+
+sedDelim=$(printf '\001')
+
 # Add variables to workspace
 while IFS=',' read -r key value category hcl sensitive
 do
-  sed -e "s/my-organization/$organization/" -e "s/my-workspace/${workspace}/" -e "s/my-key/$key/" -e "s/my-value/$value/" -e "s/my-category/$category/" -e "s/my-hcl/$hcl/" -e "s/my-sensitive/$sensitive/" < variable.template.json  > variable.json
+  fixedkey=$(escape_string "$key")
+  fixedvalue=$(escape_string "$value")
+  sed -e "s/my-organization/$organization/" -e "s/my-workspace/${workspace}/" -e "s${sedDelim}my-key${sedDelim}$fixedkey${sedDelim}" -e "s${sedDelim}my-value${sedDelim}$fixedvalue${sedDelim}" -e "s/my-category/$category/" -e "s/my-hcl/$hcl/" -e "s/my-sensitive/$sensitive/" < variable.template.json | sed -e 's|\\|\\\\|g' > variable.json
   echo "Adding variable $key with value $value in category $category with hcl $hcl and sensitive $sensitive"
   upload_variable_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @variable.json "https://${address}/api/v2/vars?filter%5Borganization%5D%5Bname%5D=${organization}&filter%5Bworkspace%5D%5Bname%5D=${workspace}")
 done < ${variables_file}
@@ -277,25 +287,40 @@ while [ $continue -ne 0 ]; do
   # Apply in some cases
   applied="false"
 
+  # Run is planning - get the plan
+  # Note that we use "True" rather than "true" because python converts the
+  # boolean "true" in json responses to "True" and "false" to "False"
+
   # planned means plan finished and no Sentinel policies
   # exist or are applicable to the workspace
-
-  # Run is planning - get the plan
   if [[ "$run_status" == "planned" ]] && [[ "$is_confirmable" == "True" ]] && [[ "$override" == "no" ]]; then
     continue=0
     echo "There are " $sentinel_policy_count "policies, but none of them are applicable to this workspace."
     echo "Check the run in Terraform Enterprise UI and apply there if desired."
     save_plan="true"
-  # planned means plan finished and no Sentinel policies
+  # cost_estimated means plan finished and costs were estimated
   # exist or are applicable to the workspace
+  elif [[ "$run_status" == "cost_estimated" ]] && [[ "$is_confirmable" == "True" ]] && [[ "$override" == "no" ]]; then
+    continue=0
+    echo "There are " $sentinel_policy_count "policies, but none of them are applicable to this workspace."
+    echo "Check the run in Terraform Enterprise UI and apply there if desired."
+    save_plan="true"
   elif [[ "$run_status" == "planned" ]] && [[ "$is_confirmable" == "True" ]] && [[ "$override" == "yes" ]]; then
-      continue=0
-      echo "There are " $sentinel_policy_count "policies, but none of them are applicable to this workspace."
-      echo "Since override was set to \"yes\", we are applying."
-      # Do the apply
-      echo "Doing Apply"
-      apply_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @apply.json https://${address}/api/v2/runs/${run_id}/actions/apply)
-      applied="true"
+    continue=0
+    echo "There are " $sentinel_policy_count "policies, but none of them are applicable to this workspace."
+    echo "Since override was set to \"yes\", we are applying."
+    # Do the apply
+    echo "Doing Apply"
+    apply_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @apply.json https://${address}/api/v2/runs/${run_id}/actions/apply)
+    applied="true"
+  elif [[ "$run_status" == "cost_estimated" ]] && [[ "$is_confirmable" == "True" ]] && [[ "$override" == "yes" ]]; then
+    continue=0
+    echo "There are " $sentinel_policy_count "policies, but none of them are applicable to this workspace."
+    echo "Since override was set to \"yes\", we are applying."
+    # Do the apply
+    echo "Doing Apply"
+    apply_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" --header "Content-Type: application/vnd.api+json" --data @apply.json https://${address}/api/v2/runs/${run_id}/actions/apply)
+    applied="true"
   # policy_checked means all Sentinel policies passed
   elif [[ "$run_status" == "policy_checked" ]]; then
     continue=0
@@ -333,6 +358,19 @@ while [ $continue -ne 0 ]; do
   elif [[ "$run_status" == "errored" ]]; then
     echo "Plan errored or hard-mandatory policy failed"
     save_plan="true"
+    continue=0
+  elif [[ "$run_status" == "planned_and_finished" ]]; then
+    echo "Plan indicates no changes to apply."
+    save_plan="true"
+    continue=0
+  elif [[ "run_status" == "canceled" ]]; then
+    echo "The run was canceled."
+    continue=0
+  elif [[ "run_status" == "force_canceled" ]]; then
+    echo "The run was canceled forcefully."
+    continue=0
+  elif [[ "run_status" == "discarded" ]]; then
+    echo "The run was discarded."
     continue=0
   else
     # Sleep and then check status again in next loop
@@ -382,6 +420,12 @@ if [[ "$applied" == "true" ]]; then
     if [[ "$apply_status" == "finished" ]]; then
       echo "Apply finished."
       continue=0
+    elif [[ "$apply_status" == "errored" ]]; then
+      echo "Apply errored."
+      continue=0
+    elif [[ "$apply_status" == "canceled" ]]; then
+      echo "Apply was canceled."
+      continue=0
     else
       # Sleep and then check apply status again in next loop
       echo "We will sleep and try again soon."
@@ -397,26 +441,9 @@ if [[ "$applied" == "true" ]]; then
   # and output to shell and file
   curl -s $apply_log_url | tee ${apply_id}.log
 
-  # Get state version IDs from after the apply
-  state_id_before=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['relationships']['state-versions']['data'][1]['id'])")
-  echo "State ID 1:" ${state_id_before}
-
-  # Call API to get information about the state version including its URL
-  state_file_before_url_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" https://${address}/api/v2/state-versions/${state_id_before})
-
-  # Get state file URL from the result
-  state_file_before_url=$(echo $state_file_before_url_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['attributes']['hosted-state-download-url'])")
-  echo "URL for state file before apply:"
-  echo ${state_file_before_url}
-
-  # Retrieve state file from the URL
-  # and output to shell and file
-  echo "State file before the apply:"
-  curl -s $state_file_before_url | tee ${apply_id}-before.tfstate
-
-  # Get state version IDs from before the apply
+  # Get state version ID from after the apply
   state_id_after=$(echo $check_result | python -c "import sys, json; print(json.load(sys.stdin)['data']['relationships']['state-versions']['data'][0]['id'])")
-  echo "State ID 0:" ${state_id_after}
+  echo "State ID:" ${state_id_after}
 
   # Call API to get information about the state version including its URL
   state_file_after_url_result=$(curl -s --header "Authorization: Bearer $TFE_TOKEN" https://${address}/api/v2/state-versions/${state_id_after})
@@ -441,6 +468,6 @@ rm run.json
 rm variable.template.json
 rm variable.json
 rm workspace.template.json
-rm workspace.json 
+rm workspace.json
 
 echo "Finished"
